@@ -87,7 +87,7 @@ elif [ "$DECODING_STRATEGY" == "sampling"  ]; then
   --temperature ${TEM} \
   --nbest 1 \
   --beam 1 \
-  2>&1 >"${OUTPUT_FILE}"
+  2>&1 >"${OUTPUT_FILE}"  # 将标准输出（stdout）和标准错误（stderr）都重定向到 ${OUTPUT_FILE} 文件中
   grep ^H "${OUTPUT_FILE}" | cut -c 3- | sort -n | cut -f3- | sed "s/ ##//g" > "${PRED_FILE}"
 else
   echo 'decoding strategy '"$DECODING_STRATEGY"' not found!'

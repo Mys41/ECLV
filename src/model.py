@@ -921,7 +921,7 @@ class TransformerEncoder(FairseqEncoder):
         return masked_logits
 
     # 训练
-    # 根据new_order重新排列编码器输出中的批次，用于训练到推理的变化
+    # 根据new_order中的索引重新排列编码器输出中的批次，用于训练到推理的变化
     def reorder_encoder_out(self, encoder_out, new_order):          # -> 推理
         if encoder_out['encoder_out'] is not None:
             encoder_out['encoder_out'] = encoder_out['encoder_out'].index_select(1, new_order)
@@ -1012,6 +1012,7 @@ class NgramTransformerDecoderLayer(nn.Module):
             latent_context=None
     ):
         # multi-head self-attention sublayer: x = layer_norm(x + dropout(self_attn(x)))
+        # [seq_x+seq_mask, batch, embed_dim]
         residual = x  # 残差
         # 在增量解码过程中，自注意力层可以使用过去的键和值来计算注意力权重
         if prev_self_attn_state is not None:
@@ -1019,6 +1020,7 @@ class NgramTransformerDecoderLayer(nn.Module):
             if incremental_state is None:
                 incremental_state = {}
             prev_key, prev_value = prev_self_attn_state
+            # 获得之前的注意力状态
             saved_state = {"prev_key": prev_key, "prev_value": prev_value}
             # 使用self.self_attn._set_input_buffer函数将saved_state设置为self.self_attn的输入缓冲区
             self.self_attn._set_input_buffer(incremental_state, saved_state)
@@ -1035,6 +1037,7 @@ class NgramTransformerDecoderLayer(nn.Module):
             latent_context=latent_context,
         )
 
+        # 编码器和解码器都是先dropout，再residual，最后layernorm
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = residual + x
         x = self.self_attn_layer_norm(x)
@@ -1060,6 +1063,8 @@ class NgramTransformerDecoderLayer(nn.Module):
                 static_kv=True,
                 need_weights=(not self.training and self.need_attn),
             )
+            # training=self.training参数是用来指示 F.dropout 是否应该执行dropout操作
+            # training=True：表示模型处于训练模式; 否则表示模型处于评估（evaluation）模式
             x = F.dropout(x, p=self.dropout, training=self.training)
             x = residual + x
             x = self.encoder_attn_layer_norm(x)
@@ -1105,8 +1110,8 @@ class NgramTransformerDecoder(FairseqIncrementalDecoder):
 
         # 参数为_input（输入序列），incremental_state（可选，用于增量解码的状态）和positions（可选，预先计算的位置）。
         # 如果positions未提供，则根据输入序列和填充索引计算位置。然后，该方法调用父类的forward方法来获取位置嵌入，
-        # 并返回位置嵌入和实际位置。max_positions方法返回模型支持的最大位置数。如果设置了填充索引，
-        # 则最大位置数等于嵌入数量减去填充索引再减一；否则，最大位置数等于嵌入数量。
+        # 并返回位置嵌入和实际位置。max_positions方法返回模型支持的最大位置数。
+        # 如果设置了填充索引，则最大位置数等于嵌入数量减去填充索引再减一；否则，最大位置数等于嵌入数量。
         self.embed_ap_token = LearnedPositionalEmbeddingNew(
             self.max_target_positions_token + 2 + self.padding_idx, self.embed_dim, self.padding_idx,
         )
@@ -1150,7 +1155,9 @@ class NgramTransformerDecoder(FairseqIncrementalDecoder):
             self, prev_output_tokens, encoder_out=None,
             incremental_state=None, vae_hidden=None, **kwargs
     ):
+        # 提取输入的特征
         x_list, extra = self.extract_features(prev_output_tokens, encoder_out, incremental_state, **kwargs)
+        # x_list[0]是当前时间步的输出，而x_list[1:]则是未来ngram标记的预测
         x_predicted = x_list[1:]
         # x_predicted = x_list
         x_predicted = [self.output_layer(x) for x in x_predicted]
@@ -1231,9 +1238,10 @@ class NgramTransformerDecoder(FairseqIncrementalDecoder):
         # latent_context -> [batch_size, latent_dim]
         latent_context = self.vae_transform(latent_context)
         # latent_context -> [batch_size, 2 * embedding_dim]]
+        # head_dim = embed_dim // decoder_num_heads
         latent_context = latent_context.view(-1, 1, 2 * self.head_dim)
         # latent_context -> [batch_size * num_heads, 1, 2 * head_dim
-        # 沿着最后一个维度将latent_context分割为大小为self.head_dim的块
+        # 沿着最后一个维度将latent_context分割为两个块，分别代表键和值
         latent_context = torch.split(latent_context, self.head_dim, dim=-1)
         # latent_context -> [batch_size * num_heads, 1, self.head_dim]
         return latent_context
@@ -1255,7 +1263,7 @@ class NgramTransformerDecoder(FairseqIncrementalDecoder):
             i_buckets_main_stream, i_bucket_relative_stream = \
                 self.cal_finetune_relative_positions(real_positions)
 
-        # 计算预测流位置嵌入
+        # 计算预测流位置嵌入，也就是当前真实位置 + 1
         predicting_stream_pos_embed = self.embed_ap_token._forward(real_positions + 1)
 
         if incremental_state is not None:
@@ -1274,7 +1282,7 @@ class NgramTransformerDecoder(FairseqIncrementalDecoder):
         if main_stream_pos_embed is not None:
             x += main_stream_pos_embed
 
-        x = x.transpose(0, 1)
+        x = x.transpose(0, 1)  # [seq, batch, embed_dim]
         attn = None
 
         inner_states = [x]  # 将内部状态设为x
@@ -1283,8 +1291,9 @@ class NgramTransformerDecoder(FairseqIncrementalDecoder):
             print('positions should be used to predict ngrams')
             raise Exception()
 
-        # 嵌入缩放
+        # 将嵌入层的权重进行缩放
         if self.embed_scale is not None:
+            # [ngram, embed_dim]
             ngram_input_embed = self.embed_scale * self.ngram_input_embed.weight
         else:
             ngram_input_embed = self.ngram_input_embed.weight
@@ -1292,8 +1301,9 @@ class NgramTransformerDecoder(FairseqIncrementalDecoder):
 
         # 如果使用增量解码
         if incremental_state is not None:
-            B = x.size(1)  # B为x的第二个维度的大小
-            # 将n-gram的输入嵌入与预测流位置嵌入相加，然后转置并重复B次
+            B = x.size(1)  # B 为 x 的第二个维度的大小, 即 batch
+            # 将大小为[embed_dim]的ngram_input_embed[ngram - 1]通过广播机制与predicting_stream_pos_embed相加
+            # 然后转置并重复 B 次, 保证最终的的批次大小和x一致
             ngram_masks = [
                 (ngram_input_embed[ngram - 1] + predicting_stream_pos_embed).transpose(0, 1).repeat(1, B, 1)
                 for ngram in range(self.ngram)]
@@ -1302,10 +1312,11 @@ class NgramTransformerDecoder(FairseqIncrementalDecoder):
             ngram_masks = [(ngram_input_embed[ngram - 1] + predicting_stream_pos_embed).transpose(0, 1) for
                            ngram in range(self.ngram)]
 
-        # 如果使用增量解码，就直接使用缓存的掩码
+        # 如果不使用增量解码，就直接使用缓存的掩码
         self_attn_mask = self.buffered_future_mask(x) if incremental_state is None else None
         ngram_mask_matrix = self.buffered_future_mask_ngram(x) if incremental_state is None else None
 
+        # [seq_x+seq_mask, batch, embed_dim]
         x = torch.cat([x] + ngram_masks, 0)  # 将x与ngram掩码连接
 
         # 层归一化
@@ -1329,12 +1340,12 @@ class NgramTransformerDecoder(FairseqIncrementalDecoder):
             latent_context = None
         # 将隐变量z映射到一个额外的内存向量
         else:
-            # latent_context -> [batch_size * num_heads, 1, self.head_dim]
+            # 包含两个元素的元组，latent_context -> [batch_size * num_heads, 1, self.head_dim]
             latent_context = self.transform_latent_context(encoder_out['z'])
 
         for layer in self.layers:
             x, attn = layer(
-                x,
+                x,  # [seq_x+seq_mask, batch, embed_dim]
                 encoder_out['encoder_out'] if encoder_out is not None else None,
                 encoder_out['encoder_padding_mask'] if encoder_out is not None else None,
                 incremental_state,
@@ -1351,6 +1362,7 @@ class NgramTransformerDecoder(FairseqIncrementalDecoder):
         # chunk函数的第一个参数1+self.ngram指定了要创建的块的数量，第二个参数1指定了沿着哪个维度进行分割
         # print("x:", x)
         # print("attn:", attn)
+        # 获得解码器预测的未来ngram个输出的列表
         x_list = x.transpose(0, 1).chunk(1 + self.ngram, 1)
         if attn is not None:
             # chunk将张量沿着1维分成ngram+1块

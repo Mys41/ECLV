@@ -467,7 +467,8 @@ class NgramMultiheadAttention(nn.Module):
 
         return result
 
-    def forward(self, query,
+    # ngram_self_attn
+    def forward(self, query,  # [seq_x+seq_mask, batch, embed_dim]
                 incremental_state=None,
                 static_kv=False,
                 self_attn_mask=None,
@@ -478,15 +479,17 @@ class NgramMultiheadAttention(nn.Module):
                 latent_context=None,
                 ):
 
+        # query就是输入x和未来ngram掩码的连接
         tgt_len, bsz, embed_dim = query.size()
         assert embed_dim == self.embed_dim
         assert list(query.size()) == [tgt_len, bsz, embed_dim]
 
+        # 如果进行增量解码
         if incremental_state is not None:
+            # 获得保存的先前注意力状态(键和值)
             saved_state = self._get_input_buffer(incremental_state)
             if 'prev_key' in saved_state:
-                # previous time steps are cached - no need to recompute
-                # key and value if they are static
+                # 之前的时间步被缓存，如果它们是静态的，则无需重新计算键和值
                 if static_kv:
                     assert self.encoder_decoder_attention and not self.self_attention
                     key = value = None
@@ -495,20 +498,24 @@ class NgramMultiheadAttention(nn.Module):
 
         # q,k,v -> [3 * seq_len, batch_size, embedding_dim]
         q, k, v = self.in_proj_qkv(query)
+        # q * (embed_dim // num_heads ** -0.5)
         q = q * self.scaling
 
         if self.bias_k is not None:
             assert self.bias_v is not None
+            # 将 self.bias_k 和 self.bias_v 分别重复 bsz 次并与 k 和 v 进行拼接
             k = torch.cat([k, self.bias_k.repeat(1, bsz, 1)])
             v = torch.cat([v, self.bias_v.repeat(1, bsz, 1)])
 
         # q, k, v -> [batch_size * num_heads, 3 * seq_len, head_dim]
+        # 变换qkv进行多头注意力
         q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
         if k is not None:
             k = k.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
         if v is not None:
             v = v.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
 
+        # 按照ngram数继续切分
         # h_list 3-dim list -> [seq_len, batch_size, num_heads * head_dim]
         h_list = query.chunk(1 + self.ngram, dim=0)
 
@@ -524,7 +531,8 @@ class NgramMultiheadAttention(nn.Module):
         k_main, k_predict_list = k_list[0], k_list[1:]
         v_main, v_predict_list = v_list[0], v_list[1:]
 
-        # # incremental_state 在的training和validation的阶段是None，在测试的第一步是 {}
+        # incremental_state在training和validation的阶段是None，在测试的第一步是 {}
+        # 记忆模式
         if not incremental_state and latent_context is not None:
             context_k, context_v = latent_context
             # context_k = torch.rand(bsz * self.num_heads, 1, self.head_dim).to('cuda').half()
@@ -532,6 +540,7 @@ class NgramMultiheadAttention(nn.Module):
             k_main = torch.cat([context_k, k_main], dim=1)
             v_main = torch.cat([context_v, v_main], dim=1)
 
+        # 获得保存的键值状态
         if saved_state is not None:
             # saved states are stored with shape (bsz, num_heads, seq_len, head_dim)
             if 'prev_key' in saved_state:
@@ -639,6 +648,7 @@ class NgramMultiheadAttention(nn.Module):
         attn = torch.cat(attn_result, 0).view(-1, bsz, embed_dim)
         return attn, None
 
+    # 将查询向量经过线性变换之后切分为三块，分别作为q、k、v
     def in_proj_qkv(self, query):
         return self._in_proj(query).chunk(3, dim=-1)
 
@@ -671,12 +681,14 @@ class NgramMultiheadAttention(nn.Module):
                 bias = bias[2 * self.embed_dim:]
             return F.linear(value, weight, bias)
 
+    # 对输入进行线性变换
     def _in_proj(self, input, start=0, end=None):
         weight = self.in_proj_weight
         bias = self.in_proj_bias
         weight = weight[start:end, :]
         if bias is not None:
             bias = bias[start:end]
+        # F.linear()函数的参数通常是输入数据、权重和偏置，不要和nn.Linear()混淆
         return F.linear(input, weight, bias)
 
     def reorder_incremental_state(self, incremental_state, new_order):
@@ -687,6 +699,7 @@ class NgramMultiheadAttention(nn.Module):
                 input_buffer[k] = input_buffer[k].index_select(0, new_order)
             self._set_input_buffer(incremental_state, input_buffer)
 
+    # 获得缓存的注意力状态
     def _get_input_buffer(self, incremental_state):
         return utils.get_incremental_state(
             self,
@@ -719,6 +732,7 @@ def ngram_attention_bias(length, num_skip):
     return torch.from_numpy(np.array(bias_result, dtype=np.float32))
 
 
+# 提供可学习的位置嵌入
 class LearnedPositionalEmbeddingNew(nn.Embedding):
     def __init__(
             self,
@@ -735,9 +749,12 @@ class LearnedPositionalEmbeddingNew(nn.Embedding):
         ), "If positions is pre-computed then padding_idx should not be set."
 
         if positions is None:
+            # 在增量解码中，模型通常一次生成一个输出token，并且需要知道当前生成的是序列中的哪个位置的token。
+            # 这行代码通过计算当前已经生成的序列长度_input.size(1)，并将其与填充索引self.padding_idx相加，来生成当前位置的索引
             if incremental_state is not None:
                 positions = _input.data.new(1, 1).fill_(int(self.padding_idx + _input.size(1)))
             else:
+                # 根据输入 _input 的大小和 padding_idx 来计算每个位置的索引
                 positions = utils.make_positions(
                     _input.data, self.padding_idx, onnx_trace=self.onnx_trace,
                 )

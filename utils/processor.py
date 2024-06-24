@@ -6,8 +6,6 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, BertTokenizer, Ro
 from torch.nn.utils.rnn import pad_sequence
 import re
 
-sys.path.append("/home/taoran/ECLV/utils")
-
 from comet_atomic2020_bart.utils import use_task_specific_params, trim_batch
 from models.emotion_cause_model import KBCIN
 import argparse, math
